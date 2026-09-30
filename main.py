@@ -36,7 +36,9 @@ from linebot.v3.messaging import (
     TextMessage,
     ShowLoadingAnimationRequest
 )
-import httpx
+import json
+import urllib.request
+import urllib.error
 
 # 載入環境變數
 load_dotenv()
@@ -415,8 +417,15 @@ async def process_line_events(events: list):
 
 async def forward_message_to_pms(payload: dict):
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            await client.post(PMS_WEBHOOK_URL, json=payload)
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            PMS_WEBHOOK_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=2.0):
+            pass
     except Exception:
         pass
 
