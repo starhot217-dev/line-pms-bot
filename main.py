@@ -1,17 +1,29 @@
-﻿import os, re
+import os
+import re
+import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi import FastAPI, Request, HTTPException, Header, status
+from fastapi.responses import PlainTextResponse
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage, FlexMessage, FlexContainer
+from linebot.v3.messaging import (
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage,
+    FlexMessage,
+    FlexContainer
+)
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 load_dotenv()
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 
-app = FastAPI()
+app = FastAPI(title="PMS LINE Webhook Service")
 
+# 模擬 PMS 資料庫
 CRM_DATABASE = {
     "0988123456": {
         "name": "高橋 涼介", "stay_count": 5, "total_spent": 38400, "tags": ["高樓層海景偏好", "VIP 尊榮常客"],
@@ -26,7 +38,7 @@ CRM_DATABASE = {
 }
 
 def get_guest_by_line_id(line_id: str):
-    for phone, guest in CRM_DATABASE.items():
+    for _, guest in CRM_DATABASE.items():
         if guest["line_user_id"] == line_id:
             return guest
     return None
@@ -49,28 +61,36 @@ def build_stay_flex(guest: dict):
                 {"type": "box", "layout": "horizontal", "contents": [{"type": "text", "text": "📶 客房網路", "size": "xs", "color": "#64748B", "flex": 3}, {"type": "text", "text": f"WiFi密碼: {guest['wifi_pass']}", "size": "xs", "color": "#0F172A", "flex": 7}]},
                 {"type": "box", "layout": "horizontal", "contents": [{"type": "text", "text": "⭐ CRM 資料", "size": "xs", "color": "#64748B", "flex": 3}, {"type": "text", "text": f"累積入住 {guest['stay_count']} 次｜消費 NT${guest['total_spent']:,}", "size": "xs", "color": "#0369A1", "flex": 7, "weight": "bold"}]},
                 {"type": "separator", "margin": "sm"},
-                {"type": "text", "text": f"🏷️ 偏好：{tags_str}", "size": "xxs", "color": "#94A3B8", "wrap": True}
+                {"type": "text", "text": f"🏷 偏好：{tags_str}", "size": "xxs", "color": "#94A3B8", "wrap": True}
             ]
         }
     }
     return FlexMessage(alt_text="您的專屬入住資訊卡", contents=FlexContainer.from_dict(bubble))
 
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "LINE Webhook is running"}
+
 @app.post("/webhook")
 async def line_webhook(request: Request, x_line_signature: str = Header(None)):
     if not x_line_signature:
-        raise HTTPException(status_code=400, detail="Missing Signature")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing X-Line-Signature")
+
     body = await request.body()
     body_str = body.decode("utf-8")
-    handler = WebhookHandler(CHANNEL_SECRET)
-    
+    handler = WebhookHandler(CHANNEL_SECRET if CHANNEL_SECRET else "temp_secret")
+
     @handler.add(MessageEvent, message=TextMessageContent)
     def handle_message(event):
         uid = event.source.user_id
         text = event.message.text.strip()
         conf = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+
         with ApiClient(conf) as client:
             bot = MessagingApi(client)
             guest = get_guest_by_line_id(uid)
+
+            # 1. 已綁定房客反向查詢
             if guest:
                 if "早餐" in text:
                     msg = f"【管家智慧反向查詢】\n{guest['name']} 您好！您今日入住【{guest['room_type']}】，手作海島早餐於每日 {guest['breakfast_time']} 於{guest['breakfast_location']}供應，已為您登記 {guest['breakfast_portions']} 份。若有素食或過敏忌口請直接回傳告知管家！"
@@ -83,6 +103,7 @@ async def line_webhook(request: Request, x_line_signature: str = Header(None)):
                     bot.reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[build_stay_flex(guest)]))
                     return
 
+            # 2. 自動比對電話綁定
             clean_phone = re.sub(r"[^\d]", "", text)
             if len(clean_phone) == 10 and clean_phone in CRM_DATABASE:
                 target = CRM_DATABASE[clean_phone]
@@ -93,10 +114,19 @@ async def line_webhook(request: Request, x_line_signature: str = Header(None)):
                 ]))
                 return
 
-            bot.reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="您好！歡迎加入旅宿管家。\n請直接回傳您的「訂房手機號碼」（例如：0912345678）即可連動入住資訊！")]))
+            # 3. 預設導引
+            bot.reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[
+                TextMessage(text="您好！歡迎加入旅宿管家。\n請直接回傳您的「訂房手機號碼」（例如：0912345678）即可連動入住資訊！")
+            ]))
 
     try:
         handler.handle(body_str, x_line_signature)
     except InvalidSignatureError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-    return "OK"
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid signature")
+
+    return PlainTextResponse("OK", status_code=status.HTTP_200_OK)
+
+# 讓服務在 Render 指定的 PORT 上持續常駐運作
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
